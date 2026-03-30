@@ -477,9 +477,34 @@ async def export_chm_to_htm(chm_path, export_folder):
         html_folder = find_html_folder(target_folder)
         if not html_folder:
             return False
-        return any(
-            f.lower().endswith((".htm", ".html")) for f in os.listdir(html_folder)
-        )
+        return len(list_html_files_recursive(html_folder)) > 0
+
+    def extract_failed_entries(text):
+        failed = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if "ERROR:" in line and "Data Error" in line:
+                # Typical format:
+                # ERROR: Data Error : contents/assets/images/xxx.png
+                parts = line.split(":", 2)
+                if len(parts) == 3:
+                    failed_path = parts[2].strip()
+                    if failed_path:
+                        failed.append(failed_path)
+                else:
+                    failed.append(line)
+        return failed
+
+    def write_unextract_log(target_folder, failed_files):
+        if not failed_files:
+            return
+        log_path = os.path.join(target_folder, "unextractfile.log")
+        unique_failed = sorted(set(failed_files))
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("# Files failed to extract from CHM (manual follow-up)\n")
+            for item in unique_failed:
+                f.write(f"{item}\n")
+        print(f"Saved failed extraction list to: {log_path}")
 
     async def run_7z_extract(extra_args=None):
         cmd = [seven_zip, "x", chm_path, f"-o{export_folder}", "-y"]
@@ -496,10 +521,14 @@ async def export_chm_to_htm(chm_path, export_folder):
         )
 
     try:
+        failed_entries = []
         # Step 1: Prefer extracting only HTML files to avoid non-critical
         # image/document CRC errors that commonly appear in some CHM packages.
         rc, stdout, stderr = await run_7z_extract(["-ir!*.htm", "-ir!*.html"])
+        failed_entries.extend(extract_failed_entries(stdout))
+        failed_entries.extend(extract_failed_entries(stderr))
         if rc == 0 and has_extracted_html(export_folder):
+            write_unextract_log(export_folder, failed_entries)
             return True
         if has_extracted_html(export_folder):
             print(
@@ -507,11 +536,15 @@ async def export_chm_to_htm(chm_path, export_folder):
             )
             if stderr.strip():
                 print(stderr)
+            write_unextract_log(export_folder, failed_entries)
             return True
 
         # Step 2: Fallback to full extraction if HTML-only extraction did not work
         rc, stdout, stderr = await run_7z_extract()
+        failed_entries.extend(extract_failed_entries(stdout))
+        failed_entries.extend(extract_failed_entries(stderr))
         if rc == 0 and has_extracted_html(export_folder):
+            write_unextract_log(export_folder, failed_entries)
             return True
         if has_extracted_html(export_folder):
             print(
@@ -519,6 +552,7 @@ async def export_chm_to_htm(chm_path, export_folder):
             )
             if stderr.strip():
                 print(stderr)
+            write_unextract_log(export_folder, failed_entries)
             return True
 
         print(f"Error extracting {chm_path}:")
@@ -526,6 +560,7 @@ async def export_chm_to_htm(chm_path, export_folder):
             print(stderr)
         elif stdout.strip():
             print(stdout)
+        write_unextract_log(export_folder, failed_entries)
         return False
     except Exception as e:
         print(f"Error extracting CHM file using 7z.exe: {e}")
