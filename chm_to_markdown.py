@@ -588,6 +588,12 @@ def find_html_folder(input_folder):
     if html_files:
         return input_folder
 
+    # Fallback: CHM may store HTML under nested folders (e.g. contents/, docs/, etc.)
+    # In this case, return input_folder and let recursive scanning pick up all HTML files.
+    for current_root, _, files in os.walk(input_folder):
+        if any(f.lower().endswith((".htm", ".html")) for f in files):
+            return input_folder
+
     return None
 
 
