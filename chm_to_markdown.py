@@ -6,11 +6,16 @@ import asyncio
 import argparse
 import platform
 import gc
-import chardet
+import posixpath
+from urllib.parse import urlsplit, urlunsplit
+import importlib
+import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 import html2text
 import aiofiles
+
+chardet = importlib.import_module("chardet") if importlib.util.find_spec("chardet") else None
 
 tags_to_remove = ["iframe", "object", "script", "br", "img", "meta", "link", "input"]
 classes_to_remove = [
@@ -31,6 +36,8 @@ ids_to_remove = [
     "userDataCache",
     "HT_MailLink",
 ]
+
+ENCODING_CANDIDATES = ["utf-8", "gb18030", "gbk", "gb2312"]
 DTDUCAS_LOGO = """
  .----------------.  .----------------.  .----------------.  .----------------.  .----------------.  .----------------.  .----------------. 
 | .--------------. || .--------------. || .--------------. || .--------------. || .--------------. || .--------------. || .--------------. |
@@ -52,29 +59,40 @@ def detect_file_encoding(file_path):
     try:
         with open(file_path, 'rb') as f:
             raw_data = f.read(10000)  # Read first 10KB for detection
-        result = chardet.detect(raw_data)
-        encoding = result.get('encoding', 'utf-8')
-        confidence = result.get('confidence', 0)
 
-        # For low confidence or Chinese content, try common encodings
+        # BOM-first fast paths
+        if raw_data.startswith(b"\xef\xbb\xbf"):
+            return "utf-8-sig"
+
+        if chardet:
+            result = chardet.detect(raw_data)
+            encoding = result.get('encoding', 'utf-8') or 'utf-8'
+            confidence = result.get('confidence', 0)
+        else:
+            encoding = 'utf-8'
+            confidence = 0
+
+        if encoding.lower() in ENCODING_CANDIDATES and confidence >= 0.7:
+            return encoding
+
+        # For low confidence or uncertain result, try preferred encodings
         if confidence < 0.7:
-            # Try common Chinese encodings in order
-            for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8']:
+            for enc in ENCODING_CANDIDATES:
                 try:
                     with open(file_path, 'r', encoding=enc) as f:
                         f.read(1000)
                     return enc
-                except:
+                except (UnicodeDecodeError, LookupError, OSError):
                     continue
         return encoding
-    except:
+    except OSError:
         # Fallback to trying common encodings
-        for enc in ['gb18030', 'gbk', 'gb2312', 'utf-8']:
+        for enc in ENCODING_CANDIDATES:
             try:
                 with open(file_path, 'r', encoding=enc) as f:
                     f.read(1000)
                 return enc
-            except:
+            except (UnicodeDecodeError, LookupError, OSError):
                 continue
         return 'utf-8'
 
@@ -135,23 +153,102 @@ def extract_keywords(title):
     return keywords
 
 
-def update_links(soup, file_dictionary=None):
+def normalize_doc_key(path_value):
+    normalized = (path_value or "").replace("\\", "/").strip()
+    normalized = normalized.lstrip("./")
+    normalized = posixpath.normpath(normalized)
+    if normalized == ".":
+        return ""
+    return normalized.lower()
+
+
+def list_html_files_recursive(root_folder):
+    html_files = []
+    for current_root, _, filenames in os.walk(root_folder):
+        for filename in filenames:
+            if filename.lower().endswith((".htm", ".html")):
+                full_path = os.path.join(current_root, filename)
+                rel_path = os.path.relpath(full_path, root_folder)
+                html_files.append(rel_path)
+    return sorted(html_files)
+
+
+def normalize_href_to_markdown(href):
+    if not href:
+        return href
+    parsed = urlsplit(href)
+    path = parsed.path or ""
+    if path.lower().endswith((".htm", ".html")):
+        base, _ = os.path.splitext(path)
+        path = f"{base}.md"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def update_links(soup, file_dictionary=None, current_doc_key=None):
+    link_title_map = {}
+    current_dir_key = normalize_doc_key(posixpath.dirname(current_doc_key or ""))
+
     for a in soup.find_all("a", href=True):
-        if a["href"] == "#PageHeader":
+        href = a["href"]
+        if href == "#PageHeader":
             a.decompose()
-        elif a["href"].lower().endswith((".htm", ".html")):
-            href = a["href"]
-            base_href = os.path.basename(href)
-            base, _ = os.path.splitext(base_href)
-            a["href"] = base + ".md"
-            if file_dictionary and base in file_dictionary:
-                display_name = file_dictionary[base].get("title")
-                if display_name:
-                    a["title"] = display_name
-    return soup
+        elif href.lower().startswith(("javascript:", "mailto:")):
+            a.decompose()
+        else:
+            markdown_href = normalize_href_to_markdown(href)
+            a["href"] = markdown_href
+            existing_title = a.get("title", "").strip()
+            link_title = existing_title
+            parsed = urlsplit(href)
+            if file_dictionary and parsed.path and not parsed.scheme:
+                target_path = parsed.path.replace("\\", "/")
+                if target_path.lower().endswith((".htm", ".html")):
+                    resolved_path = normalize_doc_key(
+                        posixpath.normpath(posixpath.join(current_dir_key, target_path))
+                    )
+                    target_key = os.path.splitext(resolved_path)[0]
+                    file_info = file_dictionary.get(target_key)
+                    if not file_info:
+                        base_key = os.path.splitext(os.path.basename(target_key))[0]
+                        matched_keys = [
+                            key for key in file_dictionary.keys() if key.endswith(f"/{base_key}")
+                        ]
+                        if base_key in file_dictionary:
+                            matched_keys.append(base_key)
+                        if len(matched_keys) == 1:
+                            file_info = file_dictionary.get(matched_keys[0])
+                    if file_info:
+                        display_name = file_info.get("title")
+                        if display_name:
+                            a["title"] = display_name
+                            link_title = display_name
+            if link_title:
+                link_title_map[markdown_href] = link_title
+    return soup, link_title_map
+
+
+def apply_link_titles(markdown_text, link_title_map):
+    if not link_title_map:
+        return markdown_text
+
+    pattern = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+
+    def repl(match):
+        text, url = match.group(1), match.group(2)
+        title = link_title_map.get(url)
+        if not title:
+            return match.group(0)
+        safe_title = title.replace('"', r"\"")
+        return f'[{text}]({url} "{safe_title}")'
+
+    return pattern.sub(repl, markdown_text)
 
 
 def remove_unwanted_elements(soup):
+    semantic_tags = ["style", "nav", "header", "footer"]
+    for tag in semantic_tags:
+        for element in soup.find_all(tag):
+            element.decompose()
     for tag in tags_to_remove:
         for element in soup.find_all(tag):
             element.decompose()
@@ -171,6 +268,8 @@ def remove_unwanted_elements(soup):
         "a", href=lambda href: href and "mailto:" in str(href).lower()
     ):
         a.decompose()
+    for element in soup.find_all(attrs={"role": lambda r: r in {"navigation", "banner", "contentinfo"}}):
+        element.decompose()
     return soup
 
 
@@ -215,6 +314,19 @@ def replace_code_snippets(soup):
                 lang = "xml"
             elif "json" in class_str:
                 lang = "json"
+        data_lang = (pre_tag.get("data-language") or pre_tag.get("lang") or "").lower()
+        if data_lang in {"c#", "csharp"}:
+            lang = "csharp"
+        elif data_lang in {"vb", "vb.net", "vbnet"}:
+            lang = "vb"
+        elif data_lang in {"cpp", "c++"}:
+            lang = "cpp"
+        elif data_lang in {"f#", "fsharp"}:
+            lang = "fsharp"
+        elif data_lang in {"xml", "html"}:
+            lang = "xml"
+        elif data_lang == "json":
+            lang = "json"
         placeholder = f"<<CODE_BLOCK_{counter}>>"
         code_block_markdown = f"```{lang}\n{code_text}\n```\n"
         code_blocks[placeholder] = code_block_markdown
@@ -292,11 +404,13 @@ def fix_table_block(table_lines):
     return formatted_lines
 
 
-def convert_html_to_markdown(html_content, file_dictionary=None, version=None):
+def convert_html_to_markdown(
+    html_content, file_dictionary=None, version=None, source_doc_key=None
+):
     soup = BeautifulSoup(html_content, "html.parser")
     main_title = extract_page_title(soup)
     soup = remove_unwanted_elements(soup)
-    soup = update_links(soup, file_dictionary)
+    soup, link_title_map = update_links(soup, file_dictionary, source_doc_key)
     soup, code_blocks = replace_code_snippets(soup)
     modified_html = str(soup)
     h = html2text.HTML2Text()
@@ -314,6 +428,7 @@ def convert_html_to_markdown(html_content, file_dictionary=None, version=None):
             markdown_text = f"# {main_title}\n\n{markdown_text}"
     for placeholder, code_block in code_blocks.items():
         markdown_text = markdown_text.replace(placeholder, code_block)
+    markdown_text = apply_link_titles(markdown_text, link_title_map)
     markdown_text = fix_tables(markdown_text)
     markdown_text = clean_markdown_formatting(markdown_text)
     return markdown_text
@@ -358,21 +473,102 @@ async def export_chm_to_htm(chm_path, export_folder):
                     "7z not found. Please install p7zip-full: sudo apt install p7zip-full"
                 )
                 return False
-    try:
+    def has_extracted_html(target_folder):
+        html_folder = find_html_folder(target_folder)
+        if not html_folder:
+            return False
+        return len(list_html_files_recursive(html_folder)) > 0
+
+    def extract_failed_entries(text):
+        failed = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if "ERROR:" in line and "Data Error" in line:
+                # Typical format:
+                # ERROR: Data Error : contents/assets/images/xxx.png
+                parts = line.split(":", 2)
+                if len(parts) == 3:
+                    failed_path = parts[2].strip()
+                    if failed_path:
+                        failed.append(failed_path)
+                else:
+                    failed.append(line)
+        return failed
+
+    def write_unextract_log(target_folder, failed_files):
+        if not failed_files:
+            return
+        log_path = os.path.join(target_folder, "unextractfile.log")
+        unique_failed = sorted(set(failed_files))
+        version_name = os.path.basename(os.path.normpath(target_folder))
+        suggested_root = os.path.join("output", version_name, "data")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("# Files failed to extract from CHM (manual follow-up)\n")
+            f.write("# Format: <failed_path> => <suggested_manual_target>\n")
+            for item in unique_failed:
+                normalized_item = item.replace("\\", "/").lstrip("/")
+                suggested_target = os.path.join(suggested_root, normalized_item).replace(
+                    "\\", "/"
+                )
+                f.write(f"{normalized_item} => {suggested_target}\n")
+        print(f"Saved failed extraction list to: {log_path}")
+
+    async def run_7z_extract(extra_args=None):
+        cmd = [seven_zip, "x", chm_path, f"-o{export_folder}", "-y"]
+        if extra_args:
+            cmd.extend(extra_args)
         process = await asyncio.create_subprocess_exec(
-            seven_zip,
-            "x",
-            chm_path,
-            f"-o{export_folder}",
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            print(f"Error extracting {chm_path}:")
-            print(stderr.decode())
-            return False
-        return True
+        return process.returncode, stdout.decode(errors="ignore"), stderr.decode(
+            errors="ignore"
+        )
+
+    try:
+        failed_entries = []
+        # Step 1: Prefer extracting only HTML files to avoid non-critical
+        # image/document CRC errors that commonly appear in some CHM packages.
+        rc, stdout, stderr = await run_7z_extract(["-ir!*.htm", "-ir!*.html"])
+        failed_entries.extend(extract_failed_entries(stdout))
+        failed_entries.extend(extract_failed_entries(stderr))
+        if rc == 0 and has_extracted_html(export_folder):
+            write_unextract_log(export_folder, failed_entries)
+            return True
+        if has_extracted_html(export_folder):
+            print(
+                f"Warning: 7z returned code {rc} for {chm_path}, but HTML files were extracted. Continuing."
+            )
+            if stderr.strip():
+                print(stderr)
+            write_unextract_log(export_folder, failed_entries)
+            return True
+
+        # Step 2: Fallback to full extraction if HTML-only extraction did not work
+        rc, stdout, stderr = await run_7z_extract()
+        failed_entries.extend(extract_failed_entries(stdout))
+        failed_entries.extend(extract_failed_entries(stderr))
+        if rc == 0 and has_extracted_html(export_folder):
+            write_unextract_log(export_folder, failed_entries)
+            return True
+        if has_extracted_html(export_folder):
+            print(
+                f"Warning: full extraction returned code {rc} for {chm_path}, but HTML files were extracted. Continuing."
+            )
+            if stderr.strip():
+                print(stderr)
+            write_unextract_log(export_folder, failed_entries)
+            return True
+
+        print(f"Error extracting {chm_path}:")
+        if stderr.strip():
+            print(stderr)
+        elif stdout.strip():
+            print(stdout)
+        write_unextract_log(export_folder, failed_entries)
+        return False
     except Exception as e:
         print(f"Error extracting CHM file using 7z.exe: {e}")
         return False
@@ -392,6 +588,12 @@ def find_html_folder(input_folder):
     if html_files:
         return input_folder
 
+    # Fallback: CHM may store HTML under nested folders (e.g. contents/, docs/, etc.)
+    # In this case, return input_folder and let recursive scanning pick up all HTML files.
+    for current_root, _, files in os.walk(input_folder):
+        if any(f.lower().endswith((".htm", ".html")) for f in files):
+            return input_folder
+
     return None
 
 
@@ -403,9 +605,10 @@ async def build_file_dictionary(input_folder, version=None):
     file_dictionary = {}
     semaphore = asyncio.Semaphore(20)
 
-    async def process_file_for_dict(filename):
-        input_path = os.path.join(html_folder, filename)
-        base, _ = os.path.splitext(filename)
+    async def process_file_for_dict(relative_path):
+        input_path = os.path.join(html_folder, relative_path)
+        key = os.path.splitext(normalize_doc_key(relative_path))[0]
+        output_filename = os.path.splitext(relative_path.replace("\\", "/"))[0] + ".md"
         try:
             async with semaphore:
                 html_content = await read_file_with_encoding(input_path)
@@ -413,30 +616,28 @@ async def build_file_dictionary(input_folder, version=None):
             title = extract_page_title(soup)
             file_info = {
                 "title": title if title else "Untitled Document",
-                "filename": base + ".md",
+                "filename": output_filename,
             }
             if version:
                 file_info["version"] = version
-            return base, file_info
+            return key, file_info
         except Exception as e:
             print(f"Error processing {input_path} for dictionary: {e}")
-            return base, {
+            return key, {
                 "title": "Error Document",
-                "filename": base + ".md",
+                "filename": output_filename,
                 "version": version if version else None,
             }
 
-    file_list = [
-        f for f in os.listdir(html_folder) if f.lower().endswith((".htm", ".html"))
-    ]
+    file_list = list_html_files_recursive(html_folder)
     print(f"Building dictionary from {len(file_list)} HTML files...")
     batch_size = 100
     for i in range(0, len(file_list), batch_size):
         batch_files = file_list[i : i + batch_size]
-        batch_tasks = [process_file_for_dict(filename) for filename in batch_files]
+        batch_tasks = [process_file_for_dict(relative_path) for relative_path in batch_files]
         results = await asyncio.gather(*batch_tasks)
-        for base, info in results:
-            file_dictionary[base] = info
+        for key, info in results:
+            file_dictionary[key] = info
         if (i // batch_size + 1) % 10 == 0:
             gc.collect()
     print(f"Dictionary built with {len(file_dictionary)} entries")
@@ -464,9 +665,7 @@ async def convert_files_with_dictionary(
         os.makedirs(data_folder)
     if not os.path.exists(core_folder):
         os.makedirs(core_folder)
-    file_list = [
-        f for f in os.listdir(html_folder) if f.lower().endswith((".htm", ".html"))
-    ]
+    file_list = list_html_files_recursive(html_folder)
     total_files = len(file_list)
     print(f"Converting {total_files} HTML files to Markdown...")
     semaphore = asyncio.Semaphore(semaphore_limit)
@@ -474,10 +673,12 @@ async def convert_files_with_dictionary(
         for i in range(0, total_files, batch_size):
             batch_files = file_list[i : i + batch_size]
             batch_tasks = []
-            for filename in batch_files:
-                input_path = os.path.join(html_folder, filename)
-                base, _ = os.path.splitext(filename)
-                output_path = os.path.join(data_folder, base + ".md")
+            for relative_path in batch_files:
+                input_path = os.path.join(html_folder, relative_path)
+                output_rel_path = (
+                    os.path.splitext(relative_path.replace("\\", "/"))[0] + ".md"
+                )
+                output_path = os.path.join(data_folder, output_rel_path)
                 batch_tasks.append(
                     process_file(
                         executor,
@@ -486,6 +687,7 @@ async def convert_files_with_dictionary(
                         semaphore,
                         file_dictionary,
                         version,
+                        os.path.splitext(normalize_doc_key(relative_path))[0],
                     )
                 )
             await asyncio.gather(*batch_tasks)
@@ -501,15 +703,29 @@ async def convert_files_with_dictionary(
 
 
 async def process_file(
-    executor, input_path, output_path, semaphore, file_dictionary, version=None
+    executor,
+    input_path,
+    output_path,
+    semaphore,
+    file_dictionary,
+    version=None,
+    source_doc_key=None,
 ):
     loop = asyncio.get_running_loop()
     try:
         async with semaphore:
             html_content = await read_file_with_encoding(input_path)
         markdown_content = await loop.run_in_executor(
-            executor, convert_html_to_markdown, html_content, file_dictionary, version
+            executor,
+            convert_html_to_markdown,
+            html_content,
+            file_dictionary,
+            version,
+            source_doc_key,
         )
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
         async with semaphore:
             async with aiofiles.open(output_path, "w", encoding="utf-8") as f:
                 await f.write(markdown_content)
