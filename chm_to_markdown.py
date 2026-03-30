@@ -500,10 +500,17 @@ async def export_chm_to_htm(chm_path, export_folder):
             return
         log_path = os.path.join(target_folder, "unextractfile.log")
         unique_failed = sorted(set(failed_files))
+        version_name = os.path.basename(os.path.normpath(target_folder))
+        suggested_root = os.path.join("output", version_name, "data")
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("# Files failed to extract from CHM (manual follow-up)\n")
+            f.write("# Format: <failed_path> => <suggested_manual_target>\n")
             for item in unique_failed:
-                f.write(f"{item}\n")
+                normalized_item = item.replace("\\", "/").lstrip("/")
+                suggested_target = os.path.join(suggested_root, normalized_item).replace(
+                    "\\", "/"
+                )
+                f.write(f"{normalized_item} => {suggested_target}\n")
         print(f"Saved failed extraction list to: {log_path}")
 
     async def run_7z_extract(extra_args=None):

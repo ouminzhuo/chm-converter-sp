@@ -250,7 +250,7 @@ id_to_lang = {
 - **Memory issues with large CHM files**: Try increasing the batch size and reducing max_workers to manage memory usage.
 - **Encoding issues**: The tool uses error-tolerant UTF-8 encoding, but some characters may still display incorrectly. Adjust encoding settings if needed.
 - **`ERROR: Data Error` when extracting CHM**: The converter now prioritizes extracting only `.htm/.html` files first, so CRC/data errors in non-critical assets (images, PDFs) won't block Markdown generation as long as HTML files are extracted.
-- **Failed binary assets log**: If 7z reports extraction errors (e.g., images/PDF/GIF), failed paths are written to `extracted/<version>/unextractfile.log` for manual follow-up, while successfully extracted HTML files continue to Markdown conversion.
+- **Failed binary assets log**: If 7z reports extraction errors (e.g., images/PDF/GIF), failed paths are written to `extracted/<version>/unextractfile.log` in the format `failed_path => suggested_manual_target` (target under `output/<version>/data/...`) for manual补录, while successfully extracted HTML files continue to Markdown conversion.
 
 ## License
 
